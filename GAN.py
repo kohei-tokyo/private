@@ -81,6 +81,7 @@ class StainingGAN():
         self.test_folders = self.config.test_folders
         self.name = self.config.name
         self.group = self.config.group
+        self.target = self.config.target
         self.n_epoch = self.config.n_epoch
         self.discriminator = self.config.discriminator
         self.num_workers = self.config.num_workers
@@ -95,15 +96,21 @@ class StainingGAN():
         self.images_to_use = self.config.images_to_use
         self.device = self.config.device
         self.patches_per_epoch = self.config.patches_per_epoch
+        self.patches_per_epoch_val = self.config.patches_per_epoch_val
         self.val_epoch = self.config.val_epoch
         self.batch_size = self.config.batch_size
         self.decoder_attention_type = self.config.decoder_attention_type
         self.val_crop = self.config.val_crop
         self.epoch_start_ema = self.config.epoch_start_ema
-        self.encorder_name = self.config.encorder_name
+        self.dim_mults = self.config.dim_mults
+        self.self_attension = self.config.self_attension
+        self.generator = self.config.generator
+        self.encoder_name = self.config.encoder_name
         self.ema_beta = self.config.ema_beta
+        self.plt_show = self.config.plt_show
 
         self.step_start_ema = self.epoch_start_ema * self.patches_per_epoch
+        self.target_class = len(self.target)
         self.bce_loss = torch.nn.BCEWithLogitsLoss()
         self.l1_loss = torch.nn.L1Loss().to(self.device)
         self.loss_fn_mse = torch.nn.MSELoss().to(self.device)
@@ -126,46 +133,77 @@ class StainingGAN():
         self.min_epoch_list = [0] * len(self.val_list)
         self.epoch = 0
 
-        self.G = smp.Unet(
-            encoder_name=self.encorder_name,  # choose encoder, e.g. mobilenet_v2 or efficientnet-b7
-            encoder_weights="imagenet",  # use `imagenet` pre-trained weights for encoder initialization
-            in_channels=self.in_chans,  # model input channels (1 for gray-scale images, 3 for RGB, etc.)
-            classes=self.class_num,  # model output channels (number of classes in your dataset)
-            decoder_attention_type=self.decoder_attention_type
-        ).to(self.device)
+        if self.generator == "conditional":
+            self.G = UNet_gemini(
+                c_in=2,  # ノイズ画像(3ch) + 条件画像(3ch)
+                c_out=1,  # ノイズを予測
+                base_dim=64,  # ベースとなるチャンネル数
+                dim_mults=self.dim_mults,  # 解像度ごとのチャンネル数の倍率
+                num_embeddings=self.target_class,
+                self_attension=self.self_attension,
+                device=self.device
+            ).to(self.device)
+        elif self.generator == "conditional_pretrained":
+            self.G = UNet_gemini_pretrained_ori(
+                c_in=2,
+                c_out=1,
+                num_embeddings=self.target_class,
+                self_attension=self.self_attension,
+                encoder_name=self.encoder_name,
+                device=self.device
+            ).to(self.device)
+        else:
+            self.G = smp.Unet(
+                encoder_name=self.encoder_name,  # choose encoder, e.g. mobilenet_v2 or efficientnet-b7
+                encoder_weights="imagenet",  # use `imagenet` pre-trained weights for encoder initialization
+                in_channels=self.in_chans,  # model input channels (1 for gray-scale images, 3 for RGB, etc.)
+                classes=self.class_num,  # model output channels (number of classes in your dataset)
+                decoder_attention_type=self.decoder_attention_type
+            ).to(self.device)
+
+
+        self.unet = True
         if self.discriminator == "Patch3":
-            self.D = Patch3(in_channels=self.in_chans + self.class_num).to(self.device)
+            self.D = Patch(in_channels=self.in_chans + self.class_num, depth=3).to(self.device)
         elif self.discriminator == "Patch4":
-            self.D = Patch4(in_channels=self.in_chans + self.class_num).to(self.device)
+            self.D = Patch(in_channels=self.in_chans + self.class_num, depth=4).to(self.device)
         elif self.discriminator == "Patch5":
-            self.D = Patch5(in_channels=self.in_chans + self.class_num).to(self.device)
+            self.D = Patch(in_channels=self.in_chans + self.class_num, depth=5).to(self.device)
         elif self.discriminator == "ResnetPatch":
             self.D = ResnetPatch(in_channels=self.in_chans + self.class_num).to(self.device)
-        else:
+        elif self.discriminator == "Patch_projection":
+            self.D = Patch_projection(in_channels=self.in_chans + self.class_num).to(self.device)
+        elif self.discriminator == "Resnet":
             self.D = timm.create_model("resnet18",
                                        in_chans=self.in_chans + self.class_num,
                                        pretrained=False,
                                        num_classes=1).to(self.device)
+        else:
+            self.D = Patch(in_channels=self.in_chans + self.class_num, depth=1).to(self.device)
+            self.unet = False
         self.optimizer_g = torch.optim.Adam(self.G.parameters(), lr=self.lr_g, betas=self.betas)
         self.optimizer_d = torch.optim.Adam(self.D.parameters(), lr=self.lr_d, betas=self.betas)
         self.ema = EMA(self.ema_beta)
         self.ema_G = copy.deepcopy(self.G).eval().requires_grad_(False)
 
         os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-        img_folders = [os.path.join(self.dir, f) for f in self.train_folders]
-        datasets = [DatasetDigitalStaining(img_folders[i], augmentation=None) for i in range(len(self.train_folders))]
-        combined_dataset = ConcatDataset(datasets)
-        self.train_loader = DataLoader(combined_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers,
-                                       pin_memory=True, persistent_workers=self.num_workers>0)
-        img_folders = [os.path.join(self.dir, f) for f in self.val_folders]
-        datasets = [DatasetDigitalStaining(img_folders[i], augmentation=None) for i in range(len(self.val_folders))]
-        combined_dataset = ConcatDataset(datasets)
-        self.val_loader = DataLoader(combined_dataset, batch_size=4, shuffle=False, num_workers=0, pin_memory=True)
-        img_folders = [os.path.join(self.dir, f) for f in self.test_folders]
-        datasets = [DatasetDigitalStaining(img_folders[i], augmentation=None) for i in range(len(self.test_folders))]
-        combined_dataset = ConcatDataset(datasets)
-        self.test_loader = DataLoader(combined_dataset, batch_size=4, shuffle=False)
+        self.train_loader = self.make_loader(self.train_folders, "train")
+        self.val_loader = self.make_loader(self.val_folders, "val")
+        self.test_loader = self.make_loader(self.test_folders, "test")
 
+    def make_loader(self, folders, mode):
+        datasets = []
+        for target_n in range(self.target_class):
+            for f in folders[target_n]:
+                img_folder = os.path.join(self.dir[target_n], f)
+                datasets.append(DatasetDigitalStaining(img_folder, target_n, augmentation=None))
+        combined_dataset = ConcatDataset(datasets)
+        if mode == "train":
+            return DataLoader(combined_dataset, batch_size=self.batch_size, shuffle=True,
+                              num_workers=self.num_workers, pin_memory=True, persistent_workers=self.num_workers>0)
+        else:
+            return DataLoader(combined_dataset, batch_size=4, shuffle=False,
+                              num_workers=0, pin_memory=True)
 
     def _wandb_init(self):
         self.run = wandb.init(
@@ -197,11 +235,11 @@ class StainingGAN():
         for self.test_id in test_list:
             print(f"Test {self.test_id}")
             self.G.load_state_dict(torch.load(f"path//best_model_G_stain_{self.test_id}_{self.name}.pth"))
-            self.D.load_state_dict(torch.load(f"path//best_model_D_stain_{self.test_id}_{self.name}.pth"))
             self.ema_G.load_state_dict(torch.load(f"path//best_model_G_stain_{self.test_id}_ema_{self.name}.pth"))
             self.G.to(self.device)
-            self.D.to(self.device)
             self.ema_G.to(self.device)
+            self.D.load_state_dict(torch.load(f"path//best_model_D_stain_{self.test_id}_{self.name}.pth"))
+            self.D.to(self.device)
             self.calc_epoch("test")
             self.show_result("test")
         wandb.finish()
@@ -209,7 +247,10 @@ class StainingGAN():
     def calc_epoch(self, mode):
         if mode == "train":
             self.G.train()
-            self.D.train()
+            if self.unet:
+                self.D.train()
+            else:
+                self.D.eval()
             loader = itertools.islice(self.train_loader, self.patches_per_epoch)
             patches_num = self.patches_per_epoch
             grad_ctx = torch.enable_grad()
@@ -218,20 +259,24 @@ class StainingGAN():
             self.D.eval()
             loader = self.val_loader
             patches_num = len(loader)
+            # loader = itertools.islice(self.val_loader, self.patches_per_epoch_val)
+            # patches_num = self.patches_per_epoch_val
             grad_ctx = torch.no_grad()
         elif mode == "test":
             self.G.eval()
             self.D.eval()
             loader = self.test_loader
             patches_num = len(loader)
+            # loader = itertools.islice(self.test_loader, self.patches_per_epoch_val)
+            # patches_num = self.patches_per_epoch_val
             grad_ctx = torch.no_grad()
         else:
             raise NotImplementedError
         total_metrics_dict = None
 
         with grad_ctx:
-            for ph1, ph2, real in tqdm(loader, total=patches_num):
-                metrics = self.calc_batch(ph1, ph2, real, mode)
+            for ph1, ph2, real, c in tqdm(loader, total=patches_num):
+                metrics = self.calc_batch(ph1, ph2, real, c, mode)
                 if total_metrics_dict is None:
                     total_metrics_dict = {k: 0 for k, v in metrics.items()}
                 for k, v in metrics.items():
@@ -241,9 +286,9 @@ class StainingGAN():
             total_metrics_dict[k] /= patches_num
         self.save_results(total_metrics_dict, mode)
 
-    def calc_batch(self, ph1, ph2, real, mode):
+    def calc_batch(self, ph1, ph2, real, c, mode):
         if mode == "train":
-            return self.calc_matrix(ph1, ph2, real, mode)
+            return self.calc_matrix(ph1, ph2, real, c, mode)
         else:
             if self.val_crop:
                 metrics_dict = None
@@ -256,6 +301,7 @@ class StainingGAN():
                             ph1[:, :, y_i:y_i + self.img_size, x_i:x_i + self.img_size],
                             ph2[:, :, y_i:y_i + self.img_size, x_i:x_i + self.img_size],
                             real[:, :, y_i:y_i + self.img_size, x_i:x_i + self.img_size],
+                            c,
                             mode
                         )
                         if metrics_dict is None:
@@ -263,37 +309,43 @@ class StainingGAN():
                         for k, v in metrics.items():
                             metrics_dict[k] += metrics[k]
 
+                        if len_met >= self.patches_per_epoch_val:
+                            break
+                    if len_met >= self.patches_per_epoch_val:
+                        break
+
                 for k, v in metrics_dict.items():
                     metrics_dict[k] /= len_met
                 return metrics_dict
             else:
                 return self.calc_matrix(ph1, ph2, real, mode)
 
-    def calc_matrix(self, ph1, ph2, real, mode):
+    def calc_matrix(self, ph1, ph2, real, c, mode):
         x = torch.concat([ph1, ph2], dim=1).to(self.device)
+        c = c.to(self.device)
         real = real.to(self.device)
         # real_mask = real_mask.unsqueeze(1).to(self.device)
         # fake, fake_mask = self.G(x).split(1, dim=1)
-        fake = F.sigmoid(self.G(x))
-        fake_ema = F.sigmoid(self.ema_G(x))
+        fake = F.sigmoid(self.G(x, c))
+        fake_ema = F.sigmoid(self.ema_G(x, c))
         # real_pair = torch.cat([x, real, real_mask], dim=1)
         # fake_pair = torch.cat([x, fake, fake_mask], dim=1)
         real_pair = torch.cat([x, real], dim=1)
         fake_pair = torch.cat([x, fake], dim=1)
 
-        loss_dis = self.calc_dis(real_pair, fake_pair, mode)
+        loss_dis = self.calc_dis(real_pair, fake_pair, c, mode)
         # adv_loss, l1_loss, loss_g, mse, ssim_loss, dice_loss = self.calc_gen(
         #     real_pair, fake_pair, mode, real, real_mask, fake, fake_mask
         # )
         loss_gen = self.calc_gen(
-            real_pair, fake_pair, mode, real, fake, fake_ema
+            real_pair, fake_pair, c, mode, real, fake, fake_ema
         )
 
         return dict(**loss_dis, **loss_gen)
 
-    def calc_dis(self, real_pair, fake_pair, mode):
-        pred_real = self.D(real_pair)
-        pred_fake = self.D(fake_pair.detach())
+    def calc_dis(self, real_pair, fake_pair, c, mode):
+        pred_real = self.D(real_pair, c)
+        pred_fake = self.D(fake_pair.detach(), c)
         target_real = torch.ones_like(pred_real).to(self.device)
         target_fake = torch.zeros_like(pred_fake).to(self.device)
 
@@ -305,13 +357,14 @@ class StainingGAN():
         loss_dict = {"loss_d": loss_d, "acc_real": acc_real, "acc_fake": acc_fake}
 
         if mode == "train":
-            self.optimizer_d.zero_grad()
-            loss_d.backward()
-            self.optimizer_d.step()
+            if self.unet:
+                self.optimizer_d.zero_grad()
+                loss_d.backward()
+                self.optimizer_d.step()
         return loss_dict
 
-    def calc_gen(self, real_pair, fake_pair, mode, real, fake, fake_ema):
-        pred_fake = self.D(fake_pair)
+    def calc_gen(self, real_pair, fake_pair, c, mode, real, fake, fake_ema):
+        pred_fake = self.D(fake_pair, c)
         target_fake = torch.ones_like(pred_fake).to(self.device)
 
         adv_loss = self.bce_loss(pred_fake, target_fake)
@@ -382,53 +435,29 @@ class StainingGAN():
                     else:
                         torch.save(self.ema_G.state_dict(), f"path//best_model_G_stain_{self.val_list[val_n]}_{self.name}.pth")
 
-    def show_result(self, mode, n=1):
+    def show_result(self, mode):
         if mode == "val":
             loader = self.val_loader
             n = 1
         elif mode == "test":
             loader = self.test_loader
-            n = 6
+            n = 4
         else:
             loader = self.train_loader
             n = 1
 
-        n_x = 0
-        for ph1, ph2, real in loader:
-            fake, fake_ema = self.make_fake(ph1, ph2)
-            fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-            axs[0].imshow(real[0].squeeze())
-            axs[0].axis('off')
-            axs[0].set_title('target')
-            axs[1].imshow(fake)
-            axs[1].axis('off')
-            axs[1].set_title('prediction')
-            axs[2].imshow(fake_ema)
-            axs[2].axis('off')
-            axs[2].set_title('ema_prediction')
-            plt.tight_layout()
-            plt.show()
-            n_x += 1
-            if mode == "val":
-                wandb.log({f"{mode}_image/normal" : wandb.Image(fake * 255.0),
-                           f"{mode}_image/ema" : wandb.Image(fake_ema * 255.0),
-                           "epoch" : self.epoch})
-                if self.epoch == 0:
-                    real = real[0][0].cpu().detach().numpy()
-                    wandb.log({f"{mode}_image/target" : wandb.Image(real * 255.0),})
-            if mode == "test":
-                wandb.log({f"{mode}_image/{self.test_id}" : wandb.Image(fake * 255.0),
-                           f"{mode}_image/ema_{self.test_id}" : wandb.Image(fake_ema * 255.0),
-                           "n" : n_x})
-                if self.test_id == "final":
-                    real = real[0][0].cpu().detach().numpy()
-                    wandb.log({f"{mode}_image/target" : wandb.Image(real * 255.0),
-                               "n" : n_x})
-            if n_x >= n:
-                break
+        condition_n_x = [0] * self.target_class
+        for ph1, ph2, real, c in loader:
+            if condition_n_x[c[0].item()] < n:
+                fake, fake_ema, real = self.make_fake(ph1, ph2, real, c)
+                for i in range(len(fake)):
+                    if condition_n_x[c[i].item()] < n:
+                        self.show_images(real[i], fake[i], fake_ema[i], c[i].item(), mode, condition_n_x)
+                        condition_n_x[c[i].item()] += 1
 
-    def make_fake(self, ph1, ph2):
+    def make_fake(self, ph1, ph2, real, c):
         x = torch.cat([ph1.to(self.device), ph2.to(self.device)], dim=1)
+        c = c.to(self.device)
         if self.val_crop:
             stride = self.img_size // 2
             _, _, H, W = x.shape
@@ -452,15 +481,15 @@ class StainingGAN():
             # 推論中は勾配計算を無効化してメモリ効率を上げる
             with torch.no_grad():
                 # y方向（縦）にスライド
-                for y_i in y_range:
+                for y_i in tqdm(y_range):
                     # x方向（横）にスライド
                     for x_i in x_range:
                         # GPU上のTensorから直接パッチを切り出す
                         patch = x[:, :, y_i:y_i + self.img_size, x_i:x_i + self.img_size]
 
                         # モデルで予測を実行 (GPU上で計算)
-                        predicted_patch = F.sigmoid(self.G(patch))
-                        predicted_patch_ema = F.sigmoid(self.ema_G(patch))
+                        predicted_patch = F.sigmoid(self.G(patch, c))
+                        predicted_patch_ema = F.sigmoid(self.ema_G(patch, c))
 
                         # 予測結果と重みを対応する位置に加算 (GPU上で計算)
                         predictions_sum[:, :, y_i:y_i + self.img_size, x_i:x_i + self.img_size] += predicted_patch * blending_mask
@@ -471,16 +500,46 @@ class StainingGAN():
             weights_sum[weights_sum == 0] = 1.0
 
             # 加重平均を計算して最終的な予測結果を得る (GPU上で計算)
-            fake = (predictions_sum / weights_sum)[0][0].cpu().detach().numpy()
-            fake_ema = (predictions_sum_ema / weights_sum)[0][0].cpu().detach().numpy()
+            fake = (predictions_sum / weights_sum)[:][0].cpu().detach().numpy()
+            fake_ema = (predictions_sum_ema / weights_sum)[:][0].cpu().detach().numpy()
 
         else:
             with torch.no_grad():
-                pred = self.G(x)  # [1,2,img_size,img_size]
-                pred_ema = self.ema_G(x)
-            output_pred = pred[0][0]
+                pred = self.G(x, c)  # [1,2,img_size,img_size]
+                pred_ema = self.ema_G(x, c)
+            output_pred = pred[:][0]
             fake = F.sigmoid(output_pred).cpu().detach().numpy()
-            output_pred = pred_ema[0][0]
+            output_pred = pred_ema[:][0]
             fake_ema = F.sigmoid(output_pred).cpu().detach().numpy()
 
-        return fake, fake_ema
+        return fake, fake_ema, real[:][0]
+
+    def show_images(self, real, fake, fake_ema, c, mode, condition_n_x):
+        if self.plt_show:
+            fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+            axs[0].imshow(real)
+            axs[0].axis('off')
+            axs[0].set_title(f'{self.target[c]}_target')
+            axs[1].imshow(fake)
+            axs[1].axis('off')
+            axs[1].set_title(f'{self.target[c]}_prediction')
+            axs[2].imshow(fake_ema)
+            axs[2].axis('off')
+            axs[2].set_title(f'{self.target[c]}_ema_prediction')
+            plt.tight_layout()
+            plt.show()
+        if mode == "val":
+            wandb.log({f"{mode}_image/{self.target[c]}_normal": wandb.Image(fake * 255.0),
+                       f"{mode}_image/{self.target[c]}_ema": wandb.Image(fake_ema * 255.0),
+                       "epoch": self.epoch})
+            if self.epoch == 0:
+                real = real.cpu().detach().numpy()
+                wandb.log({f"{mode}_image/{self.target[c]}_target": wandb.Image(real * 255.0), })
+        if mode == "test":
+            wandb.log({f"{mode}_image/{self.target[c]}_{self.test_id}": wandb.Image(fake * 255.0),
+                       f"{mode}_image/ema_{self.test_id}": wandb.Image(fake_ema * 255.0),
+                       "n": condition_n_x[c]})
+            if self.test_id == "final":
+                real = real.cpu().detach().numpy()
+                wandb.log({f"{mode}_image/{self.target[c]}_target": wandb.Image(real * 255.0),
+                           "n": condition_n_x[c]})

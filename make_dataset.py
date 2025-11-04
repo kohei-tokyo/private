@@ -4,9 +4,10 @@ from torch.utils.data import Dataset
 import torch
 import numpy as np
 class DatasetDigitalStaining(Dataset):
-    def __init__(self, folder, augmentation=None):
+    def __init__(self, folder, c, augmentation=None):
         self.img_path_list = os.listdir(folder)
         self.folder = folder
+        self.c = c
         self.augmentation = augmentation
 
     def __getitem__(self, i):
@@ -17,12 +18,12 @@ class DatasetDigitalStaining(Dataset):
         if self.augmentation is not None:
             transformed = self.augmentation(image=phase1, image1=phase2, image2=mito)
             phase1, phase2, mito = transformed["image"], transformed["image1"], transformed["image2"]
-            return phase1, phase2, mito
+            return phase1, phase2, mito, self.c
         else:
             phase1 = torch.from_numpy(phase1).unsqueeze(0)
             phase2 = torch.from_numpy(phase2).unsqueeze(0)
             mito = torch.from_numpy(mito).unsqueeze(0)
-            return phase1, phase2, mito
+            return phase1, phase2, mito, self.c
 
     def __len__(self):
         return len(self.img_path_list)
