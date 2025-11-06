@@ -13,7 +13,7 @@ class Patch(nn.Module):
             """Conv → (BN) → LeakyReLU"""
             layers = [nn.Conv2d(in_f, out_f, 4, stride=2, padding=1)]
             if normalize:
-                layers.append(nn.BatchNorm2d(out_f))
+                layers.append(nn.GroupNorm(num_groups=8, num_channels=out_f))
             layers.append(nn.LeakyReLU(0.2, inplace=True))
             return layers
 

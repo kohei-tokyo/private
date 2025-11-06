@@ -49,6 +49,17 @@ def lpips_calc(img1, img2, loss_fn):
     loss = loss_fn(img1, img2)
     return loss.mean()
 
+def lpips_calc_each(img1, img2, c, target, loss_fn, name):
+    loss = loss_fn(img1, img2)
+    loss_each = {}
+    loss_each[name] = loss.mean()
+    target_class = len(target)
+    for j in range(target_class):
+        loss_target = sum([loss[i] * (c[i] == j) for i in range(len(c))])
+        target_n = sum([(c[i] == j) for i in range(len(c))])
+        loss_each[f"{name}_{target[j]}"] = loss_target / (target_n + 1e-5)
+    return loss_each
+
 def create_gaussian_blending_mask(patch_size, device):
     """
     中央が1に近く、端が0に近いガウシアン風の重み付けマップを生成する。
@@ -108,6 +119,7 @@ class StainingGAN():
         self.encoder_name = self.config.encoder_name
         self.ema_beta = self.config.ema_beta
         self.plt_show = self.config.plt_show
+        self.discriminator_depth = self.config.discriminator_depth
 
         self.step_start_ema = self.epoch_start_ema * self.patches_per_epoch
         self.target_class = len(self.target)
@@ -171,8 +183,10 @@ class StainingGAN():
             self.D = Patch(in_channels=self.in_chans + self.class_num, depth=5).to(self.device)
         elif self.discriminator == "ResnetPatch":
             self.D = ResnetPatch(in_channels=self.in_chans + self.class_num).to(self.device)
+        elif self.discriminator == "Patch":
+            self.D = Patch(in_channels=self.in_chans + self.class_num, depth=self.discriminator_depth).to(self.device)
         elif self.discriminator == "Patch_projection":
-            self.D = Patch_projection(in_channels=self.in_chans + self.class_num).to(self.device)
+            self.D = Patch_projection(in_channels=self.in_chans + self.class_num, depth=self.discriminator_depth).to(self.device)
         elif self.discriminator == "Resnet":
             self.D = timm.create_model("resnet18",
                                        in_chans=self.in_chans + self.class_num,
@@ -371,8 +385,6 @@ class StainingGAN():
         l1_loss = self.l1_loss(real, fake)
         ssim_loss = self.loss_fn_ssim(real, fake)
         mse = self.loss_fn_mse(real, fake)
-        if mode == "train":
-            lpips_loss = torch.tensor(0.0)
         # dice_loss = dice_loss_calc(fake_mask, real_mask)
         # loss_g = adv_loss + self.w_l1 * l1_loss + self.w_ssim * ssim_loss + self.w_dice * dice_loss
         loss_g = self.w_adv * adv_loss + self.w_l1 * l1_loss + self.w_ssim * ssim_loss
@@ -386,16 +398,16 @@ class StainingGAN():
                 "adv_loss_g": adv_loss, "l1_loss": l1_loss, "loss_g": loss_g, "mse": mse, "ssim": ssim_loss
             }
         else:
-            lpips_loss = lpips_calc(real, fake, self.loss_fn_lpips)
+            lpips_loss = lpips_calc_each(real, fake, c, self.target, self.loss_fn_lpips, "lpips")
             l1_loss_ema = self.l1_loss(real, fake_ema)
             ssim_loss_ema = self.loss_fn_ssim(real, fake_ema)
             mse_ema = self.loss_fn_mse(real, fake_ema)
-            lpips_ema = lpips_calc(real, fake_ema, self.loss_fn_lpips)
+            lpips_loss_ema = lpips_calc_each(real, fake_ema, c, self.target, self.loss_fn_lpips, "lpips_ema")
             loss_dict = {
                 "adv_loss_g": adv_loss, "l1_loss": l1_loss, "loss_g": loss_g, "mse": mse, "ssim": ssim_loss,
-                "lpips": lpips_loss, "l1_loss_ema": l1_loss_ema, "ssim_ema": ssim_loss_ema, "mse_ema": mse_ema,
-                "lpips_ema": lpips_ema,
+                "l1_loss_ema": l1_loss_ema, "ssim_ema": ssim_loss_ema, "mse_ema": mse_ema,
             }
+            loss_dict = dict(**loss_dict, **lpips_loss, **lpips_loss_ema)
         return loss_dict
 
     def save_results(self, total_metrics_dict, mode):
@@ -414,6 +426,11 @@ class StainingGAN():
             if self.test_id == "lpips":
                 self.run.summary["lpips"] = total_metrics_dict["lpips"]
                 self.run.summary["lpips_ema"] = total_metrics_dict["lpips_ema"]
+                for i in range(self.target_class):
+                    self.run.log({f"{mode}/lpips_{self.target[i]}": total_metrics_dict[f"lpips_{self.target[i]}"],
+                                  "ema": 0})
+                    self.run.log({f"{mode}/lpips_{self.target[i]}": total_metrics_dict[f"lpips_ema_{self.target[i]}"],
+                                  "ema": 1})
         else:
             total_metrics_dict_log = {f"{mode}/" + k: v for k, v in total_metrics_dict.items()}
             epoch_dict = {"epoch": self.epoch}
@@ -537,7 +554,7 @@ class StainingGAN():
                 wandb.log({f"{mode}_image/{self.target[c]}_target": wandb.Image(real * 255.0), })
         if mode == "test":
             wandb.log({f"{mode}_image/{self.target[c]}_{self.test_id}": wandb.Image(fake * 255.0),
-                       f"{mode}_image/ema_{self.test_id}": wandb.Image(fake_ema * 255.0),
+                       f"{mode}_image/{self.target[c]}_ema_{self.test_id}": wandb.Image(fake_ema * 255.0),
                        "n": condition_n_x[c]})
             if self.test_id == "final":
                 real = real.cpu().detach().numpy()

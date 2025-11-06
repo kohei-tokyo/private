@@ -32,7 +32,7 @@ class DigitalStainingConfig:
     dim_mults:tuple = (1, 2, 4, 4)
     self_attension: bool = True
     generator: str = "conditional_pretrained"
-
+    discriminator_depth: int = 4
     encoder_name: str = "resnet34"  # "resnet34", "resnet50", or "efficientnet-b4"
     decoder_attention_type: Optional[str] = None  # 'scse' or None
     discriminator: str = "Patch4"  # Patch4, Patch3, Patch5, ResnetPatch, Resnet, or U_Net

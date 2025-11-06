@@ -325,6 +325,10 @@ class UNet_gemini_pretrained_ori(nn.Module):
         self.ups = nn.ModuleList([])
         # ボトルネックの出力から開始
         in_ch = mid_dim
+        if encoder_name == "resnet34":
+            decoder_channels = [32, 64, 64, 128, 256]
+        else:
+            decoder_channels = dims
 
         # 解像度レベルを逆順にループ (例: 512->512, 512->256, 256->128, 128->128)
         for i in reversed(range(num_resolutions)):
@@ -338,7 +342,7 @@ class UNet_gemini_pretrained_ori(nn.Module):
 
             # このレベルの出力チャンネル数
             # res_out_ch = dims[i - 1] if not is_last else dims[i - 2]
-            res_out_ch = dims[i]
+            res_out_ch = decoder_channels[i]
 
             self.ups.append(
                 nn.ModuleList([
