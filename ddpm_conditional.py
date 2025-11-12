@@ -44,7 +44,7 @@ class Diffusion_ddim:
         sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None, None]
         sqrt_one_minus_alpha_hat = torch.sqrt(1 - self.alpha_hat[t])[:, None, None, None]
         Ɛ = torch.randn_like(x)
-        return sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * Ɛ, Ɛ
+        return sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * Ɛ, Ɛ, sqrt_alpha_hat
 
     def sample_timesteps(self, n):
         return torch.randint(low=1, high=self.noise_steps, size=(n,))
@@ -69,9 +69,11 @@ class Diffusion_ddim:
                 t_tensor = (torch.ones(n) * t).long().to(self.device)
 
                 # print(x.shape)
-                predicted_noise = model(x, t_tensor, labels)
+                prediction = model(x, t_tensor, labels)
+                predicted_noise = prediction[:, 0:1, :, :]
                 if self.cfg_scale > 0:
-                    uncond_predicted_noise = model(x, t_tensor.to(self.device), None)
+                    uncond_prediction = model(x, t_tensor.to(self.device), None)
+                    uncond_predicted_noise = uncond_prediction[:, 0:1, :, :]
                     predicted_noise = torch.lerp(uncond_predicted_noise, predicted_noise, self.cfg_scale)
                 # alpha = self.alpha[t][:, None, None, None]
                 alpha_hat = self.alpha_hat[t]
@@ -122,7 +124,7 @@ class Diffusion_ddpm:
         sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None, None]
         sqrt_one_minus_alpha_hat = torch.sqrt(1 - self.alpha_hat[t])[:, None, None, None]
         Ɛ = torch.randn_like(x)
-        return sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * Ɛ, Ɛ
+        return sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * Ɛ, Ɛ, sqrt_alpha_hat
 
     def sample_timesteps(self, n):
         return torch.randint(low=1, high=self.noise_steps, size=(n,))

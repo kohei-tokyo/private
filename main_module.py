@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from torch.utils.data import ConcatDataset
 from pytorch_msssim import ssim
+from dataclasses import asdict
 import timm
 import torch.nn.functional as F
 import lpips
@@ -19,123 +20,139 @@ import itertools
 import wandb
 from make_dataset import DatasetDigitalStaining
 from ddpm_conditional import Diffusion_ddim, Diffusion_ddpm
+from config import DDPMConfig
 
 
 def tensor_ssim(img1, img2):
-    return 1.0 - ssim(img1, img2, data_range=1.0, size_average=True)
+    # return 1.0 - ssim(img1, img2, data_range=1.0, size_average=True)
+    return 1.0 - ssim(img1, img2, data_range=1.0, size_average=False)
+
+def create_gaussian_blending_mask(patch_size, device):
+    """
+    中央が1に近く、端が0に近いガウシアン風の重み付けマップを生成する。
+    PyTorch Tensorとして作成し、GPU上に配置する。
+    """
+    x_coords = torch.arange(patch_size, device=device)
+    y_coords = torch.arange(patch_size, device=device)
+    center = (patch_size - 1) / 2.0
+
+    dist_from_center_x = (x_coords - center) ** 2
+    dist_from_center_y = (y_coords - center) ** 2
+
+    sigma = patch_size / 4.0
+    mask_x = torch.exp(-dist_from_center_x / (2 * sigma ** 2))
+    mask_y = torch.exp(-dist_from_center_y / (2 * sigma ** 2))
+
+    # 2Dの重みマップ (1, 1, H, W) の形式にしてブロードキャスト可能にする
+    blending_mask = torch.outer(mask_y, mask_x).unsqueeze(0).unsqueeze(0)
+
+    return blending_mask
 
 class DDPM(nn.Module):
-    def __init__(
-            self,
-            dir,
-            name="Run",  # 名称
-            group=None,
-            train_folders=["train"],  # Trainデータのフォルダ名
-            val_folders=["val"],  # Valデータのフォルダ名
-            test_folders=["test"],  # Testデータのフォルダ名
-            n_epoch=10,
-            num_workers=8,  # GPUのメモリが足りない場合は小さくしてください
-            in_chans=2,
-            learning_rate=3e-4,
-            images_to_use="both",
-            device=torch.device(f'cuda:{torch.cuda.current_device()}' if torch.cuda.is_available() else 'cpu'),
-            patches_per_epoch=200,
-            patches_per_epoch_val=5,
-            val_epoch=1,
-            batch_size=16,
-            image_size=256,
-            noise_add=True,
-            cfg_scale=3,
-            no_label=True,
-            noise_steps=10,
-            num_inference_steps=50,
-            mode_dif="ddim",
-            model_unet="original",
-            dim_mults=(1, 2, 4, 4),
-            *args,
-            **kwargs
-    ):
+    def __init__(self, config: DDPMConfig, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.test_id = None
-        self.dir = dir
-        self.name = name
-        self.group = group
-        self.train_folders = train_folders
-        self.val_folders = val_folders
-        self.test_folders = test_folders
-        self.n_epoch = n_epoch
-        self.num_workers = num_workers
-        self.in_chans = in_chans
-        self.learning_rate = learning_rate
-        self.images_to_use = images_to_use
-        self.device = device
-        self.patches_per_epoch = patches_per_epoch
-        self.patches_per_epoch_val = patches_per_epoch_val
-        self.val_epoch = val_epoch
-        self.batch_size = batch_size
-        self.image_size = image_size
-        self.noise_add = noise_add
-        self.cfg_scale = cfg_scale
-        self.no_label = no_label
-        self.noise_steps = noise_steps
-        self.num_inference_steps = num_inference_steps
-        self.mode_dif = mode_dif
+        self.config = config
+        # --- パスとデータに関する設定 ---
+        self.dir = self.config.dir
+        self.train_folders = self.config.train_folders
+        self.val_folders = self.config.val_folders
+        self.test_folders = self.config.test_folders
+        self.images_to_use = self.config.images_to_use
 
-        if model_unet == "original":
+        # --- 実験管理 (W&Bなど) ---
+        self.name = self.config.name
+        self.group = self.config.group
+
+        # --- 学習ループに関する設定 ---
+        self.n_epoch = self.config.n_epoch
+        self.learning_rate = self.config.learning_rate
+        self.batch_size = self.config.batch_size
+        self.patches_per_epoch = self.config.patches_per_epoch
+        self.patches_per_epoch_val = self.config.patches_per_epoch_val
+        self.val_epoch = self.config.val_epoch
+        self.w_ssim = self.config.w_ssim
+        self.w_target = self.config.w_target
+
+        # --- UNetモデルのアーキテクチャ設定 ---
+        self.model_unet = self.config.model_unet
+        self.in_chans = self.config.in_chans
+        self.dim_mults = self.config.dim_mults
+        self.real_pred = self.config.real_pred
+
+        # --- 拡散過程に関する設定 ---
+        self.noise_steps = self.config.noise_steps
+        self.noise_add = self.config.noise_add
+
+        # --- 推論に関する設定 ---
+        self.img_size = self.config.img_size
+        self.pred_size = self.config.pred_size
+        self.num_inference_steps = self.config.num_inference_steps
+        self.mode_dif = self.config.mode_dif
+        self.cfg_scale = self.config.cfg_scale
+        self.no_label = self.config.no_label
+        self.val_crop = self.config.val_crop
+
+        # --- 環境設定 ---
+        self.num_workers = self.config.num_workers
+        self.device = self.config.device
+
+        c_out = 2 if self.real_pred else 1
+        if self.model_unet == "original":
             self.model = UNet_conditional_ori(
-                c_in=in_chans + 1,
-                c_out=1,
-                device=device
-            ).to(device)
-        elif model_unet == "deep":
+                c_in=self.in_chans + 1,
+                c_out=c_out,
+                device=self.device
+            ).to(self.device)
+        elif self.model_unet == "deep":
             self.model = UNet_conditional_deep(
-                c_in=in_chans + 1,
-                c_out=1,
-                device=device
-            ).to(device)
-        elif model_unet == "dc_5":
+                c_in=self.in_chans + 1,
+                c_out=c_out,
+                device=self.device
+            ).to(self.device)
+        elif self.model_unet == "dc_5":
             self.model = UNet_conditional_dc_5(
-                c_in=in_chans + 1,
-                c_out=1,
-                device=device
-            ).to(device)
-        elif model_unet == "sa_5":
+                c_in=self.in_chans + 1,
+                c_out=c_out,
+                device=self.device
+            ).to(self.device)
+        elif self.model_unet == "sa_5":
             self.model = UNet_conditional_sa_5(
-                c_in=in_chans + 1,
-                c_out=1,
-                device=device
-            ).to(device)
-        elif model_unet == "gemini":
+                c_in=self.in_chans + 1,
+                c_out=c_out,
+                device=self.device
+            ).to(self.device)
+        elif self.model_unet == "gemini":
             self.model = UNet_gemini(
-                c_in=in_chans + 1,
-                c_out=1,
-                dim_mults=dim_mults,
-                device=device
-            ).to(device)
+                c_in=self.in_chans + 1,
+                c_out=c_out,
+                dim_mults=self.dim_mults,
+                device=self.device
+            ).to(self.device)
         else:
             self.model = UNet_conditional(
-                c_in=in_chans + 1,
-                c_out=1,
-                device=device
-            ).to(device)
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate)
-        if mode_dif == "ddim":
-            self.diffusion = Diffusion_ddim(noise_steps=noise_steps, img_size=image_size, device=device,
-                                            noise_add=noise_add, cfg_scale=cfg_scale)
+                c_in=self.in_chans + 1,
+                c_out=c_out,
+                device=self.device
+            ).to(self.device)
+
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.learning_rate)
+
+        if self.mode_dif == "ddim":
+            self.diffusion = Diffusion_ddim(noise_steps=self.noise_steps, img_size=self.img_size, device=self.device,
+                                            noise_add=self.noise_add, cfg_scale=self.cfg_scale)
         else:
-            self.diffusion = Diffusion_ddpm(noise_steps=noise_steps, img_size=image_size, device=device,
-                                            noise_add=noise_add, cfg_scale=cfg_scale)
+            self.diffusion = Diffusion_ddpm(noise_steps=self.noise_steps, img_size=self.img_size, device=self.device,
+                                            noise_add=self.noise_add, cfg_scale=self.cfg_scale)
+
         self.ema = EMA(0.995)
         self.ema_model = copy.deepcopy(self.model).eval().requires_grad_(False)
-        self.loss_fn_mse = nn.MSELoss().to(device)
+        self.loss_fn_mse = nn.MSELoss().to(self.device)
         self.loss_fn_ssim = tensor_ssim
-        self.loss_fn_lpips = lpips.LPIPS(net='alex').to(device)
+        self.loss_fn_lpips = lpips.LPIPS(net='alex').to(self.device)
         self.hist = {"train": [], "val": [], "test": []}
         self.val_list = [
-            "mse",
             "ssim",
             "lpips",
-            "mse_ema",
             "ssim_ema",
             "lpips_ema",
         ]
@@ -144,21 +161,32 @@ class DDPM(nn.Module):
         self.epoch = 0
 
         os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-        img_folders = [os.path.join(dir, f) for f in train_folders]
-        datasets = [DatasetDigitalStaining(img_folders[i], augmentation=None) for i in range(len(train_folders))]
+
+        # Train DataLoader
+        img_folders = [os.path.join(self.dir, f) for f in self.train_folders]
+        datasets = [DatasetDigitalStaining(img_folders[i], augmentation=None) for i in range(len(self.train_folders))]
         combined_dataset = ConcatDataset(datasets)
-        self.train_loader = DataLoader(combined_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-                                       pin_memory=True, persistent_workers= num_workers > 0)
-        img_folders = [os.path.join(dir, f) for f in val_folders]
-        datasets = [DatasetDigitalStaining(img_folders[i], augmentation=None) for i in range(len(val_folders))]
+        self.batch_size_train = self.batch_size
+        self.batch_size = 1
+        self.train_loader = DataLoader(combined_dataset, batch_size=self.batch_size_train, shuffle=True,
+                                       num_workers=self.num_workers,
+                                       pin_memory=True, persistent_workers=self.num_workers > 0)
+
+        # Validation DataLoader
+        img_folders = [os.path.join(self.dir, f) for f in self.val_folders]
+        datasets = [DatasetDigitalStaining(img_folders[i], augmentation=None) for i in range(len(self.val_folders))]
         combined_dataset = ConcatDataset(datasets)
-        self.val_loader = DataLoader(combined_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-                                     pin_memory=True, persistent_workers= num_workers > 0)
-        img_folders = [os.path.join(dir, f) for f in test_folders]
-        datasets = [DatasetDigitalStaining(img_folders[i], augmentation=None) for i in range(len(test_folders))]
+        self.val_loader = DataLoader(combined_dataset, batch_size=self.batch_size, shuffle=False,
+                                     num_workers=self.num_workers, drop_last=True,
+                                     pin_memory=True, persistent_workers=self.num_workers > 0)
+
+        # Test DataLoader
+        img_folders = [os.path.join(self.dir, f) for f in self.test_folders]
+        datasets = [DatasetDigitalStaining(img_folders[i], augmentation=None) for i in range(len(self.test_folders))]
         combined_dataset = ConcatDataset(datasets)
-        self.test_loader = DataLoader(combined_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-                                     pin_memory=True, persistent_workers= num_workers > 0)
+        self.test_loader = DataLoader(combined_dataset, batch_size=self.batch_size, shuffle=False,
+                                      num_workers=self.num_workers, drop_last=True,
+                                      pin_memory=True, persistent_workers=self.num_workers > 0)
 
     def all(self):
         self.train()
@@ -169,11 +197,11 @@ class DDPM(nn.Module):
             # Set the wandb entity where your project will be logged (generally your team name).
             entity="kohei_tokyo-the-university-of-tokyo",
             # Set the wandb project where this run will be logged.
-            project="Digital_Staining",
+            project="Diffusion_model",
             name=self.name,
             group=self.group,
             # Track hyperparameters and run metadata.
-            config={},
+            config=asdict(self.config),
         )
 
     def train(self, noise_add=None, cfg_scale=None, mode_dif=None):
@@ -187,14 +215,9 @@ class DDPM(nn.Module):
         for self.epoch in range(self.n_epoch):
             print(f"Epoch {self.epoch + 1}/{self.n_epoch}")
             self.calc_epoch("train")
-            torch.save(self.model.state_dict(), f"path//best_model_stain_final_{self.name}.pth")
-            torch.save(self.ema_model.state_dict(), f"path//best_model_stain_final_ema_{self.name}.pth")
             if self.epoch % self.val_epoch == 0:
                 self.calc_epoch("val")
                 self.show_result("val")
-
-        for val_n in range(len(self.val_list)):
-            print(f"min_epoch_{self.val_list[val_n]} {self.min_epoch_list[val_n] + 1}")
 
     def test(self, noise_add=None, cfg_scale=None, mode_dif=None):
         if cfg_scale is not None:
@@ -203,11 +226,13 @@ class DDPM(nn.Module):
             self.noise_add = noise_add
         if mode_dif is not None:
             self.mode_dif = mode_dif
-        test_list = ["final", "ssim", "mse", "lpips"]
+        test_list = ["final", "ssim", "lpips"]
         for self.test_id in test_list:
             print(f"Test {self.test_id}")
             self.model.load_state_dict(torch.load(f"path//best_model_stain_{self.test_id}_{self.name}.pth"))
             self.model.to(self.device)
+            self.ema_model.load_state_dict(torch.load(f"path//best_model_stain_{self.test_id}_ema_{self.name}.pth"))
+            self.ema_model.to(self.device)
             self.calc_epoch("test")
             self.show_result("test")
         wandb.finish()
@@ -220,15 +245,17 @@ class DDPM(nn.Module):
             grad_ctx = torch.enable_grad()
         elif mode == "val":
             self.model.eval()
-            loader = itertools.islice(self.val_loader, self.patches_per_epoch_val)
-            # loader = self.val_loader
-            patches_num = self.patches_per_epoch_val
+            # loader = itertools.islice(self.val_loader, self.patches_per_epoch_val)
+            # patches_num = self.patches_per_epoch_val
+            loader = self.val_loader
+            patches_num = len(loader)
             grad_ctx = torch.no_grad()
         elif mode == "test":
             self.model.eval()
-            loader = itertools.islice(self.test_loader, self.patches_per_epoch_val)
-            # loader = self.test_loader
-            patches_num = self.patches_per_epoch_val
+            # loader = itertools.islice(self.test_loader, self.patches_per_epoch_val)
+            # patches_num = self.patches_per_epoch_val
+            loader = self.test_loader
+            patches_num = len(loader)
             grad_ctx = torch.no_grad()
         else:
             raise NotImplementedError
@@ -251,7 +278,33 @@ class DDPM(nn.Module):
         if mode == "train":
             return self.calc_matrix_train(ph1, ph2, real)
         else:
-            return self.calc_matrix_test(ph1, ph2, real)
+            metrics_dict = None
+            len_met = 0
+            _, _, H, W = ph1.shape
+            n = self.patches_per_epoch_val
+            for y_i in range(H // 2, H - self.img_size + 1, self.img_size):
+                for x_i in range(W // 2, W - self.img_size + 1, self.img_size):
+                    len_met += 1
+                    # print(ph1[:, :, y_i:y_i + self.img_size, x_i:x_i + self.img_size].shape)
+                    metrics = self.calc_matrix_test(
+                        ph1[:, :, y_i:y_i + self.img_size, x_i:x_i + self.img_size],
+                        ph2[:, :, y_i:y_i + self.img_size, x_i:x_i + self.img_size],
+                        real[:, :, y_i:y_i + self.img_size, x_i:x_i + self.img_size]
+                    )
+                    if metrics_dict is None:
+                        metrics_dict = {k: 0 for k, v in metrics.items()}
+                    for k, v in metrics.items():
+                        metrics_dict[k] += metrics[k]
+                    n = n - 1
+                    if n <= 0:
+                        break
+                if n <= 0:
+                    break
+
+            for k, v in metrics_dict.items():
+                metrics_dict[k] /= len_met
+            return metrics_dict
+            # return self.calc_matrix_test(ph1, ph2, real)
 
     def calc_matrix_train(self, ph1, ph2, real):
         x = torch.concat([ph1, ph2], dim=1).to(self.device)
@@ -259,33 +312,57 @@ class DDPM(nn.Module):
         # predict = F.sigmoid(self.model(x))
 
         t = self.diffusion.sample_timesteps(real.shape[0]).to(self.device)
-        x_t, noise = self.diffusion.noise_images(real, t)
-        if self.no_label:
-            if np.random.random() < 0.1:
-                x = None
-        predicted_noise = self.model(x_t, t, x)
-        loss = self.loss_fn_mse(noise, predicted_noise)
+        x_t, noise, sqrt_alpha_hat = self.diffusion.noise_images(real, t)
+        if np.random.random() < self.no_label:
+            label_train = True
+            x = None
+        else:
+            label_train = False
+        if self.real_pred:
+            prediction = self.model(x_t, t, x)
+            loss_mse = self.loss_fn_mse(noise, prediction[:, 0:1, :, :])
+            if label_train:
+                loss_ssim = torch.tensor(0.0)
+                loss_target = torch.tensor(0.0)
+            else:
+                loss_ssim = self.loss_fn_ssim(real, prediction[:, 1:2, :, :]).mean()
+                # loss_ssim = torch.tensor(0.0)
+                output = 1 / sqrt_alpha_hat * (x_t - torch.sqrt(1 - sqrt_alpha_hat ** 2) * prediction[:, 0:1, :, :])
+                t_target_weight = 1 - 1 / (1 + torch.exp(-1 * (t.detach() - 500) / 50))
+                # plt.imshow(output[0][0].detach().cpu().numpy())
+                # plt.axis("off")
+                # plt.show()
+                loss_target = (self.loss_fn_ssim(real, output) * t_target_weight).mean()
+                # print(t_target_weight)
+                # print(loss_target)
+            loss = (loss_mse + self.w_ssim * loss_ssim + self.w_target * loss_target).mean()
+            # print(loss)
+            output_dict = {"mse": loss_mse, "ssim": loss_ssim, "target": loss_target, "loss": loss}
+        else:
+            predicted_noise = self.model(x_t, t, x)
+            loss = self.loss_fn_mse(noise, predicted_noise)
+            output_dict = {"mse": loss}
 
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
         self.ema.step_ema(self.ema_model, self.model)
-        return {"mse": loss}
+        return output_dict
 
     def calc_matrix_test(self, ph1, ph2, real):
         x = torch.concat([ph1, ph2], dim=1).to(self.device)
         real = real.to(self.device)
 
-        ema_sampled_images = self.diffusion.sample(self.ema_model, n=self.batch_size, labels=x, noise_add=self.noise_add, cfg_scale=self.cfg_scale)
-        mse_loss_ema = self.loss_fn_mse(real, ema_sampled_images)
-        ssim_loss_ema = self.loss_fn_ssim(real, ema_sampled_images)
-        lpips_loss_ema = self.loss_fn_lpips(real, ema_sampled_images).mean()
-
         sampled_images = self.diffusion.sample(self.model, n=self.batch_size, labels=x, num_inference_steps=self.num_inference_steps, noise_add=self.noise_add, cfg_scale=self.cfg_scale)
-        # print(real.shape, sampled_images.shape, ema_sampled_images.shape)
+        # print(real.shape, sampled_images.shape, sampled_images.shape)
         mse_loss = self.loss_fn_mse(real, sampled_images)
         ssim_loss = self.loss_fn_ssim(real, sampled_images)
         lpips_loss = self.loss_fn_lpips(real, sampled_images).mean()
+
+        ema_sampled_images = self.diffusion.sample(self.ema_model, n=self.batch_size, labels=x, num_inference_steps=self.num_inference_steps, noise_add=self.noise_add, cfg_scale=self.cfg_scale)
+        mse_loss_ema = self.loss_fn_mse(real, ema_sampled_images)
+        ssim_loss_ema = self.loss_fn_ssim(real, ema_sampled_images)
+        lpips_loss_ema = self.loss_fn_lpips(real, ema_sampled_images).mean()
 
         return {
             "mse": mse_loss,
@@ -300,8 +377,22 @@ class DDPM(nn.Module):
         self.hist[mode].append(total_metrics_dict)
         for k, v in total_metrics_dict.items():
             print(f"{mode} {k}: {v}")
-        total_metrics_dict_log = {f"{mode}_" + k: v for k, v in total_metrics_dict.items()}
-        self.run.log(total_metrics_dict_log)
+        if mode == "test":
+            if self.test_id == "final":
+                total_metrics_dict_data = [[k, v] for k, v in total_metrics_dict.items()]
+                wandb.log({f"{mode}/{self.test_id}": wandb.Table(data=total_metrics_dict_data, columns=["index", "score"])})
+            else:
+                self.run.log({f"{mode}/{self.test_id}": total_metrics_dict[self.test_id],
+                              "ema": 0})
+                self.run.log({f"{mode}/{self.test_id}": total_metrics_dict[f"{self.test_id}_ema"],
+                              "ema": 1})
+            if self.test_id == "lpips":
+                self.run.summary["lpips"] = total_metrics_dict["lpips"]
+                self.run.summary["lpips_ema"] = total_metrics_dict["lpips_ema"]
+        else:
+            total_metrics_dict_log = {f"{mode}/" + k: v for k, v in total_metrics_dict.items()}
+            epoch_dict = {"epoch": self.epoch}
+            self.run.log(dict(**total_metrics_dict_log, **epoch_dict))
 
         if mode == "val":
             torch.save(self.model.state_dict(), f"path//best_model_stain_final_{self.name}.pth")
@@ -312,7 +403,6 @@ class DDPM(nn.Module):
                     print(f"Loss_{self.val_list[val_n]} improved to {mean_loss}, saving model")
                     self.best_score_list[val_n] = mean_loss
                     self.min_epoch_list[val_n] = self.epoch
-                    torch.save(self.model.state_dict(),f"path//best_model_stain_{self.val_list[val_n]}_{self.name}.pth")
                     if val_n < len(self.val_list) / 2:
                         torch.save(self.model.state_dict(), f"path//best_model_stain_{self.val_list[val_n]}_{self.name}.pth")
                     else:
@@ -321,46 +411,63 @@ class DDPM(nn.Module):
     def show_result(self, mode, image_n=1):
         if mode == "val":
             loader = self.val_loader
-            n = image_n
+            # n = 1 + image_n
+            # n_lim = image_n
+            n = 1
         elif mode == "test":
             loader = self.test_loader
-            n = 6
+            n = 4
+            # n_lim = 0
         else:
             loader = self.train_loader
             n = 1
-
+            # n_lim = 0
+        n_x = 0
         for ph1, ph2, real in loader:
-            if n <= 1:
-                _, _, H, W = ph1.shape
-                x = torch.cat([ph1[0:1].to(self.device), ph2[0:1].to(self.device)], dim=1)
-                with torch.no_grad():
-                    pred = self.diffusion.sample(self.model, n=1, labels=x, num_inference_steps=self.num_inference_steps,
-                                                 noise_add=self.noise_add, cfg_scale=self.cfg_scale)
-                    pred_ema = self.diffusion.sample(self.ema_model, n=1, labels=x, num_inference_steps=self.num_inference_steps,
-                                                 noise_add=self.noise_add, cfg_scale=self.cfg_scale)
-                output_pred = pred[0][0].cpu().detach().numpy()
-                output_pred_ema = pred_ema[0][0].cpu().detach().numpy()
+            # if n_x >= n_lim:
+            output_pred, output_pred_ema, real = self.make_prediction(mode, ph1, ph2, real)
+            for i in range(len(output_pred)):
+                # if n_x >= n_lim:
                 fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-                axs[0].imshow(real[0].squeeze())
+                axs[0].imshow(real[i])
                 axs[0].axis('off')
                 axs[0].set_title('target')
-                axs[1].imshow(output_pred)
+                axs[1].imshow(output_pred[i])
                 axs[1].axis('off')
                 axs[1].set_title('prediction')
-                axs[2].imshow(output_pred_ema)
+                axs[2].imshow(output_pred_ema[i])
                 axs[2].axis('off')
                 axs[2].set_title('ema_prediction')
                 plt.tight_layout()
                 plt.show()
-                wandb.log({f"{mode}_{self.test_id}_pred": wandb.Image(((np.clip(output_pred, -1, 1) + 1) / 2) * 255)})
-                wandb.log({f"{mode}_{self.test_id}_pred_ema": wandb.Image(((np.clip(output_pred_ema, -1, 1) + 1) / 2) * 255)})
-            n = n - 1
-            if mode == "val":
-                if n <= 0:
+                if mode == "val":
+                    wandb.log({f"{mode}_image/normal": wandb.Image((output_pred[i] + 1) * 0.5 * 255.0),
+                               f"{mode}_image/ema": wandb.Image((output_pred_ema[i] + 1) * 0.5 * 255.0),
+                               "epoch": self.epoch})
+                    if self.epoch == 0:
+                        # real = real[:][0].cpu().detach().numpy()
+                        wandb.log({f"{mode}_image/target": wandb.Image((real[i] + 1) * 0.5 * 255.0), })
+                if mode == "test":
+                    wandb.log({f"{mode}_image/{self.test_id}": wandb.Image((output_pred[i] + 1) * 0.5 * 255.0),
+                               f"{mode}_image/ema_{self.test_id}": wandb.Image((output_pred_ema[i] + 1) * 0.5 * 255.0),
+                               "n": n_x})
+                    if self.test_id == "final":
+                        # real = real[:][0].cpu().detach().numpy()
+                        wandb.log({f"{mode}_image/target": wandb.Image((real[i] + 1) * 0.5 * 255.0),
+                                   "n": n_x})
+                n_x += 1
+                if n_x >= n:
                     break
-            else:
-                if n <= -5:
-                    break
+            if n_x >= n:
+                break
+
+    #     for ph1, ph2, real in loader:
+    #         if n_x < n:
+    #             output_pred, output_pred_ema, real = self.make_prediction(mode, ph1, ph2, real)
+    #             for i in range(len(output_pred)):
+    #                 if n_x < n:
+    #                     self.show_images(real[i], output_pred[i], output_pred_ema[i], mode, n_x)
+    #                     condition_n_x[c[i].item()] += 1
 
     def result_image(self, n_first=1, n_long=1, num_inference_steps=50, noise_add=True, cfg_scale=3, model="normal"):
         loader = self.val_loader
@@ -371,10 +478,10 @@ class DDPM(nn.Module):
                 x = torch.cat([ph1[0:1].to(self.device), ph2[0:1].to(self.device)], dim=1)
                 with torch.no_grad():
                     if model == "normal":
-                        pred = self.diffusion.sample(self.model, n=1, labels=x, num_inference_steps=num_inference_steps,
+                        pred = self.diffusion.sample(self.model, n=self.batch_size, labels=x, num_inference_steps=num_inference_steps,
                                                      noise_add=noise_add, cfg_scale=cfg_scale)
                     else:
-                        pred = self.diffusion.sample(self.ema_model, n=1, labels=x, num_inference_steps=num_inference_steps,
+                        pred = self.diffusion.sample(self.ema_model, n=self.batch_size, labels=x, num_inference_steps=num_inference_steps,
                                                      noise_add=noise_add, cfg_scale=cfg_scale)
                 output_pred = pred[0][0].cpu().detach().numpy()
                 fig, axs = plt.subplots(1, 2, figsize=(10, 5))
@@ -390,7 +497,208 @@ class DDPM(nn.Module):
             if n <= 0:
                 break
 
+    def make_prediction(self, mode, ph1, ph2, real):
+        if mode == "val":
+            pred_size = self.img_size * self.val_crop
+        else:
+            pred_size = self.pred_size
 
+        stride = self.img_size // 2
+        _, _, H, W = ph1.shape
+        # H_res = H % stride
+        # W_res = W % stride
+        # y_range = np.arange(0, H - self.img_size + 1, stride)
+        # x_range = np.arange(0, W - self.img_size + 1, stride)
+        # if H_res > 0:
+        #     y_range = np.append(y_range, (H - self.img_size))
+        # if W_res > 0:
+        #     x_range = np.append(x_range, (W - self.img_size))
+        H_range = [H // 2 - pred_size // 2, H // 2 + pred_size // 2]
+        W_range = [W // 2 - pred_size // 2, W // 2 + pred_size // 2]
+
+        ph1 = ph1[:, :, H_range[0]: H_range[1], W_range[0]: W_range[1]]
+        ph2 = ph2[:, :, H_range[0]: H_range[1], W_range[0]: W_range[1]]
+        real = real[:, :, H_range[0]: H_range[1], W_range[0]: W_range[1]]
+        y_range = np.arange(0, pred_size - self.img_size + 1, stride)
+        x_range = np.arange(0, pred_size - self.img_size + 1, stride)
+
+        # 予測結果と重みを蓄積するためのTensorをGPU上に初期化
+        predictions_sum = torch.zeros_like(ph1, dtype=torch.float32).to(self.device)
+        predictions_sum_ema = torch.zeros_like(ph1, dtype=torch.float32).to(self.device)
+        weights_sum = torch.zeros_like(ph1, dtype=torch.float32).to(self.device)
+
+        # 重み付けマップを生成 (GPU上に作成)
+        blending_mask = create_gaussian_blending_mask(self.img_size, self.device)
+
+        # 推論中は勾配計算を無効化してメモリ効率を上げる
+        with torch.no_grad():
+            # y方向（縦）にスライド
+            for y_i in tqdm(y_range):
+                # x方向（横）にスライド
+                for x_i in x_range:
+                    # GPU上のTensorから直接パッチを切り出す
+                    # patch = x[:, :, y_i:y_i + self.img_size, x_i:x_i + self.img_size]
+                    patch = torch.concat([
+                        ph1[:, :, y_i:y_i + self.img_size, x_i:x_i + self.img_size],
+                        ph2[:, :, y_i:y_i + self.img_size, x_i:x_i + self.img_size]
+                    ], dim=1).to(self.device)
+
+                    # print(x.shape)
+                    # print(patch.shape)
+
+                    # モデルで予測を実行 (GPU上で計算)
+                    predicted_patch = self.diffusion.sample(self.model, n=self.batch_size, labels=patch,
+                                                 num_inference_steps=self.num_inference_steps,
+                                                 noise_add=self.noise_add, cfg_scale=self.cfg_scale)
+                    predicted_patch_ema = self.diffusion.sample(self.ema_model, n=self.batch_size, labels=patch,
+                                                     num_inference_steps=self.num_inference_steps,
+                                                     noise_add=self.noise_add, cfg_scale=self.cfg_scale)
+
+                    # 予測結果と重みを対応する位置に加算 (GPU上で計算)
+                    predictions_sum[:, :, y_i:y_i + self.img_size, x_i:x_i + self.img_size] += predicted_patch * blending_mask
+                    predictions_sum_ema[:, :, y_i:y_i + self.img_size, x_i:x_i + self.img_size] += predicted_patch_ema * blending_mask
+                    weights_sum[:, :, y_i:y_i + self.img_size, x_i:x_i + self.img_size] += blending_mask
+
+                    if not self.val_crop:
+                        if mode == "val":
+                            break
+                if not self.val_crop:
+                    if mode == "val":
+                        break
+
+        # ゼロ除算を避ける
+        weights_sum[weights_sum == 0] = 1.0
+
+        # 加重平均を計算して最終的な予測結果を得る (GPU上で計算)
+        fake = (predictions_sum / weights_sum)[:][0].cpu().detach().numpy()
+        fake_ema = (predictions_sum_ema / weights_sum)[:][0].cpu().detach().numpy()
+        real = real[:][0].cpu().detach().numpy()
+
+        # else:
+        #     with torch.no_grad():
+        #         pred = self.diffusion.sample(self.model, n=1, labels=x,
+        #                                                 num_inference_steps=self.num_inference_steps,
+        #                                                 noise_add=self.noise_add, cfg_scale=self.cfg_scale)
+        #         pred_ema = self.diffusion.sample(self.ema_model, n=1, labels=x,
+        #                                                     num_inference_steps=self.num_inference_steps,
+        #                                                     noise_add=self.noise_add, cfg_scale=self.cfg_scale)
+        #     output_pred = pred[0][0]
+        #     fake = F.sigmoid(output_pred).cpu().detach().numpy()
+        #     output_pred = pred_ema[0][0]
+        #     fake_ema = F.sigmoid(output_pred).cpu().detach().numpy()
+
+        return fake, fake_ema, real
+    #
+    #
+    # def show_result(self, mode):
+    #     if mode == "val":
+    #         loader = self.val_loader
+    #         n = 1
+    #     elif mode == "test":
+    #         loader = self.test_loader
+    #         n = 4
+    #     else:
+    #         loader = self.train_loader
+    #         n = 1
+    #
+    #     n_x = 0
+    #     for ph1, ph2, real in loader:
+    #         if n_x < n:
+    #             output_pred, output_pred_ema, real = self.make_prediction(mode, ph1, ph2, real)
+    #             for i in range(len(output_pred)):
+    #                 if n_x < n:
+    #                     self.show_images(real[i], output_pred[i], output_pred_ema[i], mode, n_x)
+    #                     condition_n_x[c[i].item()] += 1
+    #
+    # def make_fake(self, ph1, ph2, real, c):
+    #     x = torch.cat([ph1.to(self.device), ph2.to(self.device)], dim=1)
+    #     c = c.to(self.device)
+    #     if self.val_crop:
+    #         stride = self.img_size // 2
+    #         _, _, H, W = x.shape
+    #         H_res = H % stride
+    #         W_res = W % stride
+    #         y_range = np.arange(0, H - self.img_size + 1, stride)
+    #         x_range = np.arange(0, W - self.img_size + 1, stride)
+    #         if H_res > 0:
+    #             y_range = np.append(y_range, (H - self.img_size))
+    #         if W_res > 0:
+    #             x_range = np.append(x_range, (W - self.img_size))
+    #
+    #         # 予測結果と重みを蓄積するためのTensorをGPU上に初期化
+    #         predictions_sum = torch.zeros_like(ph1, dtype=torch.float32).to(self.device)
+    #         predictions_sum_ema = torch.zeros_like(ph1, dtype=torch.float32).to(self.device)
+    #         weights_sum = torch.zeros_like(ph1, dtype=torch.float32).to(self.device)
+    #
+    #         # 重み付けマップを生成 (GPU上に作成)
+    #         blending_mask = create_gaussian_blending_mask(self.img_size, self.device)
+    #
+    #         # 推論中は勾配計算を無効化してメモリ効率を上げる
+    #         with torch.no_grad():
+    #             # y方向（縦）にスライド
+    #             for y_i in tqdm(y_range):
+    #                 # x方向（横）にスライド
+    #                 for x_i in x_range:
+    #                     # GPU上のTensorから直接パッチを切り出す
+    #                     patch = x[:, :, y_i:y_i + self.img_size, x_i:x_i + self.img_size]
+    #
+    #                     # モデルで予測を実行 (GPU上で計算)
+    #                     predicted_patch = F.sigmoid(self.G(patch, c))
+    #                     predicted_patch_ema = F.sigmoid(self.ema_G(patch, c))
+    #
+    #                     # 予測結果と重みを対応する位置に加算 (GPU上で計算)
+    #                     predictions_sum[:, :, y_i:y_i + self.img_size, x_i:x_i + self.img_size] += predicted_patch * blending_mask
+    #                     predictions_sum_ema[:, :, y_i:y_i + self.img_size, x_i:x_i + self.img_size] += predicted_patch_ema * blending_mask
+    #                     weights_sum[:, :, y_i:y_i + self.img_size, x_i:x_i + self.img_size] += blending_mask
+    #
+    #         # ゼロ除算を避ける
+    #         weights_sum[weights_sum == 0] = 1.0
+    #
+    #         # 加重平均を計算して最終的な予測結果を得る (GPU上で計算)
+    #         fake = (predictions_sum / weights_sum)[:][0].cpu().detach().numpy()
+    #         fake_ema = (predictions_sum_ema / weights_sum)[:][0].cpu().detach().numpy()
+    #
+    #     else:
+    #         with torch.no_grad():
+    #             pred = self.G(x, c)  # [1,2,img_size,img_size]
+    #             pred_ema = self.ema_G(x, c)
+    #         output_pred = pred[:][0]
+    #         fake = F.sigmoid(output_pred).cpu().detach().numpy()
+    #         output_pred = pred_ema[:][0]
+    #         fake_ema = F.sigmoid(output_pred).cpu().detach().numpy()
+    #
+    #     return fake, fake_ema, real[:][0]
+    #
+    # def show_images(self, real, fake, fake_ema, c, mode, condition_n_x):
+    #     if self.plt_show:
+    #         fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+    #         axs[0].imshow(real)
+    #         axs[0].axis('off')
+    #         axs[0].set_title(f'{self.target[c]}_target')
+    #         axs[1].imshow(fake)
+    #         axs[1].axis('off')
+    #         axs[1].set_title(f'{self.target[c]}_prediction')
+    #         axs[2].imshow(fake_ema)
+    #         axs[2].axis('off')
+    #         axs[2].set_title(f'{self.target[c]}_ema_prediction')
+    #         plt.tight_layout()
+    #         plt.show()
+    #     if mode == "val":
+    #         wandb.log({f"{mode}_image/{self.target[c]}_normal": wandb.Image(fake * 255.0),
+    #                    f"{mode}_image/{self.target[c]}_ema": wandb.Image(fake_ema * 255.0),
+    #                    "epoch": self.epoch})
+    #         if self.epoch == 0:
+    #             real = real.cpu().detach().numpy()
+    #             wandb.log({f"{mode}_image/{self.target[c]}_target": wandb.Image(real * 255.0), })
+    #     if mode == "test":
+    #         wandb.log({f"{mode}_image/{self.target[c]}_{self.test_id}": wandb.Image(fake * 255.0),
+    #                    f"{mode}_image/ema_{self.test_id}": wandb.Image(fake_ema * 255.0),
+    #                    "n": condition_n_x[c]})
+    #         if self.test_id == "final":
+    #             real = real.cpu().detach().numpy()
+    #             wandb.log({f"{mode}_image/{self.target[c]}_target": wandb.Image(real * 255.0),
+    #                        "n": condition_n_x[c]})
+    #
 # def _train(args):
 #     setup_logging(args.run_name)
 #     device = args.device
