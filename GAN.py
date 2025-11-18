@@ -56,8 +56,9 @@ def lpips_calc_each(img1, img2, c, target, loss_fn, name):
     target_class = len(target)
     for j in range(target_class):
         loss_target = sum([loss[i] * (c[i] == j) for i in range(len(c))])
-        target_n = sum([(c[i] == j) for i in range(len(c))])
-        loss_each[f"{name}_{target[j]}"] = loss_target / (target_n + 1e-5)
+        loss_each[f"{name}_{target[j]}"] = loss_target
+        #target_n = sum([(c[i] == j) for i in range(len(c))])
+        #loss_each[f"{name}_{target[j]}"] = loss_target / (target_n + 1e-5)
     return loss_each
 
 def create_gaussian_blending_mask(patch_size, device):
@@ -120,6 +121,7 @@ class StainingGAN():
         self.ema_beta = self.config.ema_beta
         self.plt_show = self.config.plt_show
         self.discriminator_depth = self.config.discriminator_depth
+        self.lr_scheduler = self.config.lr_scheduler
 
         self.step_start_ema = self.epoch_start_ema * self.patches_per_epoch
         self.target_class = len(self.target)
@@ -195,8 +197,21 @@ class StainingGAN():
         else:
             self.D = Patch(in_channels=self.in_chans + self.class_num, depth=1).to(self.device)
             self.unet = False
+
         self.optimizer_g = torch.optim.Adam(self.G.parameters(), lr=self.lr_g, betas=self.betas)
         self.optimizer_d = torch.optim.Adam(self.D.parameters(), lr=self.lr_d, betas=self.betas)
+        if self.lr_scheduler:
+            total_steps = self.n_epoch * self.patches_per_epoch
+            self.scheduler_g = torch.optim.lr_scheduler.OneCycleLR(
+                self.optimizer_g,
+                max_lr=self.lr_g,
+                total_steps=total_steps
+            )
+            self.scheduler_d = torch.optim.lr_scheduler.OneCycleLR(
+                self.optimizer_d,
+                max_lr=self.lr_d,
+                total_steps=total_steps
+            )
         self.ema = EMA(self.ema_beta)
         self.ema_G = copy.deepcopy(self.G).eval().requires_grad_(False)
 
@@ -287,9 +302,12 @@ class StainingGAN():
         else:
             raise NotImplementedError
         total_metrics_dict = None
+        self.target_num = [0] * self.target_class
 
         with grad_ctx:
             for ph1, ph2, real, c in tqdm(loader, total=patches_num):
+                for target_c in c:
+                    self.target_num[target_c] += 1
                 metrics = self.calc_batch(ph1, ph2, real, c, mode)
                 if total_metrics_dict is None:
                     total_metrics_dict = {k: 0 for k, v in metrics.items()}
@@ -298,6 +316,9 @@ class StainingGAN():
 
         for k, v in total_metrics_dict.items():
             total_metrics_dict[k] /= patches_num
+            for target_c in range(self.target_class):
+                if self.target[target_c] in k:
+                    total_metrics_dict[k] = v / self.target_num[target_c]
         self.save_results(total_metrics_dict, mode)
 
     def calc_batch(self, ph1, ph2, real, c, mode):
@@ -330,6 +351,9 @@ class StainingGAN():
 
                 for k, v in metrics_dict.items():
                     metrics_dict[k] /= len_met
+                    for target_c in range(self.target_class):
+                        if self.target[target_c] in k:
+                            metrics_dict[k] = v
                 return metrics_dict
             else:
                 return self.calc_matrix(ph1, ph2, real, mode)
@@ -367,7 +391,7 @@ class StainingGAN():
         loss_real = self.bce_loss(pred_real, target_real)
         loss_d = (loss_real + loss_fake) * 0.5
         acc_real = pred_real.sigmoid().float().mean()
-        acc_fake = pred_fake.sigmoid().float().mean()
+        acc_fake = 1.0 - pred_fake.sigmoid().float().mean()
         loss_dict = {"loss_d": loss_d, "acc_real": acc_real, "acc_fake": acc_fake}
 
         if mode == "train":
@@ -375,6 +399,8 @@ class StainingGAN():
                 self.optimizer_d.zero_grad()
                 loss_d.backward()
                 self.optimizer_d.step()
+                if self.lr_scheduler:
+                    self.scheduler_d.step()
         return loss_dict
 
     def calc_gen(self, real_pair, fake_pair, c, mode, real, fake, fake_ema):
@@ -393,6 +419,8 @@ class StainingGAN():
             self.optimizer_g.zero_grad()
             loss_g.backward()
             self.optimizer_g.step()
+            if self.lr_scheduler:
+                self.scheduler_g.step()
             self.ema.step_ema(self.ema_G, self.G, step_start_ema=self.step_start_ema)
             loss_dict = {
                 "adv_loss_g": adv_loss, "l1_loss": l1_loss, "loss_g": loss_g, "mse": mse, "ssim": ssim_loss
@@ -426,10 +454,12 @@ class StainingGAN():
             if self.test_id == "lpips":
                 self.run.summary["lpips"] = total_metrics_dict["lpips"]
                 self.run.summary["lpips_ema"] = total_metrics_dict["lpips_ema"]
-                for i in range(self.target_class):
-                    self.run.log({f"{mode}/lpips_{self.target[i]}": total_metrics_dict[f"lpips_{self.target[i]}"],
+                for c in self.target:
+                    normal_result = total_metrics_dict[f"lpips_{c}"]
+                    ema_result = total_metrics_dict[f"lpips_ema_{c}"]
+                    self.run.log({f"{mode}/lpips_{c}": normal_result,
                                   "ema": 0})
-                    self.run.log({f"{mode}/lpips_{self.target[i]}": total_metrics_dict[f"lpips_ema_{self.target[i]}"],
+                    self.run.log({f"{mode}/lpips_{c}": ema_result,
                                   "ema": 1})
         else:
             total_metrics_dict_log = {f"{mode}/" + k: v for k, v in total_metrics_dict.items()}

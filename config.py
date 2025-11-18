@@ -49,6 +49,8 @@ class DigitalStainingConfig:
     val_epoch: int = 1
     epoch_start_ema: int = 50
     ema_beta: float = 0.9999
+    lr_scheduler: bool = False
+
 
     # --- 損失関数の重み ---
     w_l1: float = 50.0

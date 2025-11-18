@@ -327,6 +327,8 @@ class UNet_gemini_pretrained_ori(nn.Module):
         in_ch = mid_dim
         if encoder_name == "resnet34":
             decoder_channels = [32, 64, 64, 128, 256]
+        elif encoder_name == "efficientnet-b4":
+            decoder_channels = [16, 32, 64, 128, 256]
         else:
             decoder_channels = dims
 
