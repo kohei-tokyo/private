@@ -1,57 +1,98 @@
 import torch
+import torch.nn as nn
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Any
+from typing import List, Tuple, Any, Optional
 
 
-# 1. すべての設定をこのデータクラスにまとめる
+# 1. 全ての設定をこの設定クラスにきれいにまとめます
 @dataclass
-class DigitalStainingConfig:
-    """DigitalStainingの全設定を保持するクラス"""
+class DDPMConfig:
+    """DDPMモデルと学習パイプラインの全設定を保持するクラス"""
 
-    # --- パス設定 ---
-    # モードに応じて意味が変わるパス
-    dir: Optional[str] = None  # train/test: 元データ, predict: 入力画像
-    new_dir: Optional[str] = None  # predict: 予測画像保存先
-
-    # データフォルダ名
+    # --- パスとデータに関する設定 ---
+    dir: str
     train_folders: List[str] = field(default_factory=lambda: ["train"])
     val_folders: List[str] = field(default_factory=lambda: ["val"])
     test_folders: List[str] = field(default_factory=lambda: ["test"])
-
-    # --- 実験管理 ---
-    name: str = "Run"
-    group: Optional[str] = None
-    target: str = "mito" # "mito" or "ER"
-    img_size: int = 256 # 128 or 256
-    val_crop: bool = True
     images_to_use: str = "both"
 
-    # --- モデルアーキテクチャ設定 ---
-    encorder_name: str = "resnet34"  # "resnet34", "resnet50", or "efficientnet-b4"
-    decoder_attention_type: Optional[str] = None  # 'scse' or None
-    discriminator: str = "Patch4"  # Patch4, Patch3, Patch5, ResnetPatch, Resnet, or U_Net
-    in_chans: int = 2
+    # --- 実験管理 (W&Bなど) ---
+    name: str = "Run"
+    group: Optional[str] = None
 
-    # --- 学習パラメータ ---
+    # --- 学習ループに関する設定 ---
     n_epoch: int = 10
-    learning_rate_g: float = 0.0002
-    learning_rate_d: float = 0.0002
-    betas: Tuple[float, float] = (0.5, 0.999)
+    learning_rate: float = 3e-4
+    batch_size: int = 16
+    patches_per_epoch: int = 200
+    patches_per_epoch_val: int = 5
+    val_epoch: int = 1
+    w_ssim: float = 0.01
+    w_target_ssim: float = 0.01
+    w_target_lpips: float = 0.01
+    t_target: int = 1000
+    lr_epoch: int = 0
+
+    # --- UNetモデルのアーキテクチャ設定 ---
+    model_unet: str = "original"
+    in_chans: int = 2
+    dim_mults: Tuple[int, ...] = (1, 2, 4, 4)
+    real_pred: bool = False
+
+    # --- 拡散過程に関する設定 ---
+    noise_steps: int = 1000
+    noise_add: bool = True
+
+    # --- 推論に関する設定 ---
+    img_size: int = 128
+    pred_size: int = 512
+    num_inference_steps: int = 30
+    mode_dif: str = "ddim"
+    cfg_scale: int = 3
+    no_label: float = 0.1
+    val_crop: float = 2
+
+    # --- 環境設定 ---
+    num_workers: int = 8
+    device: Any = field(default_factory=lambda: torch.device(
+        f'cuda:{torch.cuda.current_device()}' if torch.cuda.is_available() else 'cpu'))
+
+    # --- VAE ---
+    vae_pth: str = "vae.pth"
+    latent_dim: int = 4
+    hidden_dims: List[int] = field(default_factory=lambda: [32, 64, 128, 256])
+
+
+@dataclass
+class VAEConfig:
+    """VAEモデルと学習パイプラインの全設定を保持するクラス"""
+
+    # --- パスとデータに関する設定 ---
+    dir: str
+    train_folders: List[str] = field(default_factory=lambda: ["train"])
+    val_folders: List[str] = field(default_factory=lambda: ["val"])
+    test_folders: List[str] = field(default_factory=lambda: ["test"])
+    images_to_use: str = "both"
+    specialize: str = None
+
+    # --- 実験管理 (W&Bなど) ---
+    name: str = "Test_vae"
+    group: Optional[str] = None
+
+    # --- 学習ループに関する設定 ---
+    n_epoch: int = 10
+    learning_rate: float = 1e-3
     batch_size: int = 16
     patches_per_epoch: int = 200
     val_epoch: int = 1
-    epoch_start_ema: int = 50
-    ema_beta: float = 0.9999
+    w_kld: float = 0.00001
+    img_size: int = 128
 
-    # --- 損失関数の重み ---
-    w_l1: float = 50.0
-    w_ssim: float = 1.0
-    w_dice: float = 1.0
-
-    # --- 予測設定 ---
-    test_id: str = "lpips"
+    # --- モデルのアーキテクチャ設定 ---
+    latent_dim: int = 4
+    hidden_dims: List[int] = field(default_factory=lambda: [32, 64, 128, 256])
 
     # --- 環境設定 ---
-    num_workers: int = 4 # GPUのメモリが足りない場合は小さくしてください
+    num_workers: int = 8
     device: Any = field(default_factory=lambda: torch.device(
         f'cuda:{torch.cuda.current_device()}' if torch.cuda.is_available() else 'cpu'))
